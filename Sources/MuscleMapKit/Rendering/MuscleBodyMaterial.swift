@@ -1,5 +1,5 @@
+import CoreGraphics
 import Foundation
-import Metal
 import RealityKit
 import simd
 import UIKit
@@ -68,18 +68,27 @@ public struct MuscleBodyStyle: Sendable, Equatable {
 }
 
 enum MuscleBodyMaterial {
+    static let rampWidth = MuscleGroup.allCases.count + 1
+    static let rampHeight = 32
+
+    static func groupColors(
+        intensities: [MuscleGroup: Double],
+        selected: Set<MuscleGroup>,
+        style: MuscleBodyStyle
+    ) -> [SIMD4<Float>] {
+        MuscleGroup.allCases.map { group in
+            style.color(for: intensities[group] ?? 0, selected: selected.contains(group))
+        }
+    }
+
+    /// CPU reference for tests: per-vertex mix of base color and the group ramp.
     static func vertexColors(
         mesh: BodyMesh,
         intensities: [MuscleGroup: Double],
         selected: Set<MuscleGroup>,
         style: MuscleBodyStyle
     ) -> [SIMD4<Float>] {
-        let all = MuscleGroup.allCases
-        var groupColor = [SIMD4<Float>](repeating: style.idleRegionColor, count: all.count)
-        for (i, group) in all.enumerated() {
-            groupColor[i] = style.color(for: intensities[group] ?? 0, selected: selected.contains(group))
-        }
-
+        let groupColor = groupColors(intensities: intensities, selected: selected, style: style)
         var colors = [SIMD4<Float>](repeating: style.baseColor, count: mesh.positions.count)
         for v in 0..<mesh.positions.count {
             let id = mesh.muscleIds[v]
@@ -90,37 +99,83 @@ enum MuscleBodyMaterial {
         return colors
     }
 
-    static func makeSurfaceMaterial() throws -> any Material {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            return fallbackMaterial()
-        }
-        let library: MTLLibrary
-        if let moduleLibrary = try? device.makeDefaultLibrary(bundle: .module) {
-            library = moduleLibrary
-        } else if let defaultLibrary = device.makeDefaultLibrary() {
-            library = defaultLibrary
-        } else {
-            return fallbackMaterial()
-        }
-
-        do {
-            let shader = CustomMaterial.SurfaceShader(named: "muscleMapSurface", in: library)
-            var material = try CustomMaterial(surfaceShader: shader, lightingModel: .lit)
-            material.faceCulling = .none
-            material.roughness = CustomMaterial.Roughness(floatLiteral: 0.48)
-            material.metallic = CustomMaterial.Metallic(floatLiteral: 0.10)
-            return material
-        } catch {
-            return fallbackMaterial()
+    /// Immutable UVs: x selects base vs muscle column, y is the baked blend weight.
+    static func textureCoordinates(mesh: BodyMesh) -> [SIMD2<Float>] {
+        let width = Float(rampWidth)
+        return (0..<mesh.vertexCount).map { index in
+            let id = mesh.muscleIds[index]
+            if id < 0 {
+                return SIMD2(0.5 / width, 0)
+            }
+            return SIMD2((Float(id) + 1.5) / width, mesh.muscleBlend[index])
         }
     }
 
-    private static func fallbackMaterial() -> PhysicallyBasedMaterial {
+    static func makeSurfaceMaterial(texture: TextureResource) -> PhysicallyBasedMaterial {
         var material = PhysicallyBasedMaterial()
-        material.baseColor = .init(tint: UIColor.white)
+        material.baseColor = .init(texture: .init(texture))
         material.roughness = .init(floatLiteral: 0.48)
         material.metallic = .init(floatLiteral: 0.10)
         material.faceCulling = .none
         return material
+    }
+
+    static func makeRampTexture(
+        intensities: [MuscleGroup: Double],
+        selected: Set<MuscleGroup>,
+        style: MuscleBodyStyle
+    ) throws -> TextureResource {
+        let groupColor = groupColors(intensities: intensities, selected: selected, style: style)
+        let width = rampWidth
+        let height = rampHeight
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            let blend = height == 1 ? 1 : Float(y) / Float(height - 1)
+            write(style.baseColor, x: 0, y: y, width: width, pixels: &pixels)
+            for group in 0..<groupColor.count {
+                let mixed = simd_mix(style.baseColor, groupColor[group], SIMD4(repeating: blend))
+                write(mixed, x: group + 1, y: y, width: width, pixels: &pixels)
+            }
+        }
+        let data = Data(pixels)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let image = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: true,
+                intent: .defaultIntent
+              ) else {
+            throw MuscleBodyMeshError.truncated
+        }
+        return try TextureResource.generate(
+            from: image,
+            withName: "muscleMapRamp",
+            options: TextureResource.CreateOptions(semantic: .color)
+        )
+    }
+
+    private static func write(
+        _ color: SIMD4<Float>,
+        x: Int,
+        y: Int,
+        width: Int,
+        pixels: inout [UInt8]
+    ) {
+        let i = (y * width + x) * 4
+        pixels[i] = channel(color.x)
+        pixels[i + 1] = channel(color.y)
+        pixels[i + 2] = channel(color.z)
+        pixels[i + 3] = channel(color.w)
+    }
+
+    private static func channel(_ value: Float) -> UInt8 {
+        UInt8(max(0, min(1, value)) * 255)
     }
 }

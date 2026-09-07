@@ -4,16 +4,15 @@ import simd
 import UIKit
 
 /// Owns one RealityKit body instance. Geometry is copied from the process-wide
-/// CPU mesh once; later intensity/selection changes rewrite only the color buffer.
+/// CPU mesh once; later intensity/selection changes replace a tiny color ramp
+/// texture without rebuilding the mesh.
 @MainActor
 final class MuscleBodyEntity {
     let root = Entity()
     let body = Entity()
 
-    private var lowLevelMesh: LowLevelMesh?
     private var meshResource: MeshResource?
     private var cpuMesh: BodyMesh?
-    private var material: (any Material)?
     private var lastIntensities: [MuscleGroup: Double] = [:]
     private var lastSelected: Set<MuscleGroup> = []
     private var lastStyle: MuscleBodyStyle?
@@ -40,30 +39,19 @@ final class MuscleBodyEntity {
 
         let mesh = MuscleBodyMesh.shared()
         cpuMesh = mesh
-        material = try MuscleBodyMaterial.makeSurfaceMaterial()
-
-        let lowLevel = try Self.makeLowLevelMesh(from: mesh)
-        let colors = MuscleBodyMaterial.vertexColors(
-            mesh: mesh,
-            intensities: MuscleIntensity.clamped(intensities),
+        let clamped = MuscleIntensity.clamped(intensities)
+        let texture = try MuscleBodyMaterial.makeRampTexture(
+            intensities: clamped,
             selected: selected,
             style: style
         )
-        Self.writeColors(colors, to: lowLevel)
-
+        let material = MuscleBodyMaterial.makeSurfaceMaterial(texture: texture)
+        let lowLevel = try Self.makeLowLevelMesh(from: mesh)
         let resource = try MeshResource(from: lowLevel)
-        let model = body.components[ModelComponent.self] ?? ModelComponent(
-            mesh: resource,
-            materials: [material ?? PhysicallyBasedMaterial()]
-        )
-        var next = model
-        next.mesh = resource
-        next.materials = [material ?? PhysicallyBasedMaterial()]
-        body.components.set(next)
+        body.components.set(ModelComponent(mesh: resource, materials: [material]))
 
-        lowLevelMesh = lowLevel
         meshResource = resource
-        lastIntensities = intensities
+        lastIntensities = clamped
         lastSelected = selected
         lastStyle = style
         attached = true
@@ -87,9 +75,7 @@ final class MuscleBodyEntity {
         style: MuscleBodyStyle
     ) {
         let clamped = MuscleIntensity.clamped(intensities)
-        guard attached,
-              let lowLevelMesh,
-              let cpuMesh else {
+        guard attached else {
             lastIntensities = clamped
             lastSelected = selected
             lastStyle = style
@@ -101,13 +87,16 @@ final class MuscleBodyEntity {
         lastIntensities = clamped
         lastSelected = selected
         lastStyle = style
-        let colors = MuscleBodyMaterial.vertexColors(
-            mesh: cpuMesh,
+        guard let texture = try? MuscleBodyMaterial.makeRampTexture(
             intensities: clamped,
             selected: selected,
             style: style
-        )
-        Self.writeColors(colors, to: lowLevelMesh)
+        ),
+              var model = body.components[ModelComponent.self] else {
+            return
+        }
+        model.materials = [MuscleBodyMaterial.makeSurfaceMaterial(texture: texture)]
+        body.components.set(model)
     }
 
     func muscle(atFace faceIndex: Int) -> MuscleGroup? {
@@ -139,6 +128,7 @@ final class MuscleBodyEntity {
     private struct StaticVertex {
         var position: SIMD3<Float>
         var normal: SIMD3<Float>
+        var uv: SIMD2<Float>
     }
 
     private static func makeLowLevelMesh(from mesh: BodyMesh) throws -> LowLevelMesh {
@@ -149,24 +139,22 @@ final class MuscleBodyEntity {
         descriptor.vertexAttributes = [
             .init(semantic: .position, format: .float3, layoutIndex: 0, offset: MemoryLayout<StaticVertex>.offset(of: \.position)!),
             .init(semantic: .normal, format: .float3, layoutIndex: 0, offset: MemoryLayout<StaticVertex>.offset(of: \.normal)!),
-            .init(semantic: .color, format: .float4, layoutIndex: 1, offset: 0),
+            .init(semantic: .uv0, format: .float2, layoutIndex: 0, offset: MemoryLayout<StaticVertex>.offset(of: \.uv)!),
         ]
         descriptor.vertexLayouts = [
-            .init(bufferIndex: 0, bufferStride: MemoryLayout<StaticVertex>.stride),
-            .init(bufferIndex: 1, bufferStride: MemoryLayout<SIMD4<Float>>.stride),
+            .init(bufferIndex: 0, bufferStride: MemoryLayout<StaticVertex>.stride)
         ]
 
+        let uvs = MuscleBodyMaterial.textureCoordinates(mesh: mesh)
         let lowLevel = try LowLevelMesh(descriptor: descriptor)
         lowLevel.replaceUnsafeMutableBytes(bufferIndex: 0) { raw in
             let vertices = raw.bindMemory(to: StaticVertex.self)
             for i in 0..<mesh.positions.count {
-                vertices[i] = StaticVertex(position: mesh.positions[i], normal: mesh.normals[i])
-            }
-        }
-        lowLevel.replaceUnsafeMutableBytes(bufferIndex: 1) { raw in
-            let colors = raw.bindMemory(to: SIMD4<Float>.self)
-            for i in 0..<mesh.positions.count {
-                colors[i] = SIMD4(0.11, 0.11, 0.125, 1)
+                vertices[i] = StaticVertex(
+                    position: mesh.positions[i],
+                    normal: mesh.normals[i],
+                    uv: uvs[i]
+                )
             }
         }
         lowLevel.replaceUnsafeMutableIndices { raw in
@@ -188,16 +176,6 @@ final class MuscleBodyEntity {
             )
         ])
         return lowLevel
-    }
-
-    private static func writeColors(_ colors: [SIMD4<Float>], to mesh: LowLevelMesh) {
-        mesh.replaceUnsafeMutableBytes(bufferIndex: 1) { raw in
-            let buffer = raw.bindMemory(to: SIMD4<Float>.self)
-            let count = min(colors.count, buffer.count)
-            for i in 0..<count {
-                buffer[i] = colors[i]
-            }
-        }
     }
 
     // MARK: - Lights & shadow

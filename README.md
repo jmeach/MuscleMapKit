@@ -132,8 +132,8 @@ then every vertex is classified into one of the seventeen groups using
 limb-axis frames. That gets baked to a compact binary blob — position, normal,
 muscle id, and a blend weight per vertex — which ships in the package.
 
-At runtime RealityKit tints by muscle id. Recoloring rewrites a vertex-color
-buffer and nothing else, so switching muscles costs no geometry work.
+At runtime RealityKit tints by muscle id. Recoloring replaces a tiny lookup
+texture and nothing else, so switching muscles costs no geometry work.
 
 Two consequences worth knowing:
 
