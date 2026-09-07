@@ -8,21 +8,22 @@ your finger, and reports taps back by muscle group.
   <img src="Media/demo.gif" width="320" alt="Toggling muscle groups on a rotating 3D body">
 </p>
 
-Built for [Cinder](https://apps.apple.com/app/id6754781687), where it answers
-the question you actually have after a session: not *did I train*, but *what
-did I actually hit*.
+This is the [jmeach/MuscleMapKit](https://github.com/jmeach/MuscleMapKit) fork
+used by [coachlyAI](https://github.com/jmeach/coachlyAI). Rendering is
+**RealityKit** (SceneKit is not used). The public SwiftUI surface is still
+`MuscleBody3DView`.
 
 ## Install
 
 ```swift
-.package(url: "https://github.com/haplollc/MuscleMapKit.git", from: "1.0.0")
+.package(url: "https://github.com/jmeach/MuscleMapKit.git", branch: "main")
 ```
 
 ```swift
 .target(name: "YourApp", dependencies: ["MuscleMapKit"])
 ```
 
-Requires iOS 17+.
+Requires iOS 18+.
 
 ## Use it
 
@@ -51,17 +52,21 @@ MuscleBody3DView(
 
 ### Inside a scrolling list
 
-Gestures are opt-out, because a body that spins under your finger will fight
-a `ScrollView` for the same drag:
+Horizontal drags rotate the body. Vertical-dominant drags are ignored so a
+parent `ScrollView` can keep scrolling. Pass `interactive: false` only when the
+map must not handle gestures at all:
 
 ```swift
 MuscleBody3DView(
     intensities: intensities,
     autoRotate: false,
-    interactive: false,        // let the scroll view win
-    initialYaw: .pi / 5        // rest at a 3/4 angle
+    interactive: false,
+    initialYaw: .pi / 5
 )
 ```
+
+Reduce Motion disables idle spin and inertial flick while leaving direct
+rotation available.
 
 ## Turning exercises into muscles
 
@@ -77,7 +82,6 @@ MuscleBody3DView(intensities: result.intensities)
 ```
 
 Volume drives the shading: more sets on a muscle means a stronger tint.
-
 Names are matched loosely, so `"bench press"`, `"Bench Press"` and
 `"  BENCH   PRESS "` all resolve to the same thing.
 
@@ -104,10 +108,6 @@ ExerciseMuscleMap.workoutIntensities(
 )
 ```
 
-In Cinder this fallback is a local LLM that classifies unknown names in one
-batched call and caches the answer forever. That model isn't part of this
-package — the hook is, so you can plug in whatever you already have.
-
 ## Muscle groups
 
 Seventeen, in gym vocabulary rather than medical nomenclature, because that's
@@ -119,6 +119,9 @@ how lifters log:
 
 Every case has a `displayName` fit for a label.
 
+`MuscleGroup.allCases` order **is** the mesh's id order. Reordering the enum
+silently repaints the body onto the wrong muscles. Tests pin that contract.
+
 ## How the body is made
 
 It's one continuous mesh, not seventeen separate props.
@@ -129,24 +132,17 @@ then every vertex is classified into one of the seventeen groups using
 limb-axis frames. That gets baked to a compact binary blob — position, normal,
 muscle id, and a blend weight per vertex — which ships in the package.
 
-At runtime SceneKit tints by muscle id. Recoloring swaps a vertex-color source
-and nothing else, so switching muscles costs no geometry work.
+At runtime RealityKit tints by muscle id. Recoloring rewrites a vertex-color
+buffer and nothing else, so switching muscles costs no geometry work.
 
 Two consequences worth knowing:
 
-- The order of `MuscleGroup.allCases` **is** the mesh's id order. Reordering
-  the enum silently repaints the body onto the wrong muscles.
+- The order of `MuscleGroup.allCases` **is** the mesh's id order.
 - Blend weights soften the seams, so neighbouring groups fade into each other
   instead of ending at a hard edge.
 
 `Tools/bake_body.py` is the baker, kept in the repo so the mesh is
 reproducible rather than a mystery binary.
-
-## Demo
-
-The showcase in the screenshot lives in
-[HaploUI](https://github.com/haplollc/HaploUI) under **Muscle Map** — presets,
-an intensity slider, and a toggle per group.
 
 ## License
 

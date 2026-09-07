@@ -1,11 +1,15 @@
 //
 //  MuscleGroup.swift
-//  Cinder
+//  MuscleMapKit
 //
 //  The gym-vocabulary muscle groups rendered by MuscleBody3DView. Each case is
 //  one selectable/colorable region of the 3D body (mirrored left/right where
 //  anatomical). Kept deliberately coarse — this matches how lifters log and
 //  think ("chest day"), not medical nomenclature.
+//
+//  SERIALIZED ASSET CONTRACT: `allCases` order is the muscle-id order stored
+//  in Resources/body.mesh. Reordering or inserting a case silently repaints
+//  the body onto the wrong muscles. Tests pin this order.
 //
 
 import Foundation
@@ -30,6 +34,29 @@ public enum MuscleGroup: String, CaseIterable, Codable, Identifiable, Sendable {
     case calves
 
     public var id: String { rawValue }
+
+    /// Index stored per vertex in `body.mesh`. Must match `allCases` order.
+    public var meshIndex: Int {
+        switch self {
+        case .chest: return 0
+        case .frontDelts: return 1
+        case .sideDelts: return 2
+        case .rearDelts: return 3
+        case .biceps: return 4
+        case .triceps: return 5
+        case .forearms: return 6
+        case .traps: return 7
+        case .lats: return 8
+        case .upperBack: return 9
+        case .lowerBack: return 10
+        case .abs: return 11
+        case .obliques: return 12
+        case .glutes: return 13
+        case .quads: return 14
+        case .hamstrings: return 15
+        case .calves: return 16
+        }
+    }
 
     public var displayName: String {
         switch self {

@@ -1,24 +1,16 @@
 //
-//  MuscleBodyGeometry.swift
-//  Cinder
+//  MuscleBodyMesh.swift
+//  MuscleMapKit
 //
-//  ONE continuous body mesh instead of balloon parts: the figure is a signed
-//  distance field (capsule/ellipsoid primitives smooth-blended into a single
-//  organic surface), meshed with naive surface nets and shaded with normals
-//  from the SDF gradient. Muscle groups are painted onto the surface — every
-//  vertex is assigned to the nearest muscle proxy region (with a soft blend
-//  band), so intensity tinting recolors regions of the body rather than
-//  lighting up separate blobs. Small "relief" bumps from the muscle proxies
-//  give definition without balloon seams.
-//
-//  Build cost ~0.3-1s → computed once per process on a background queue and
-//  cached (see MuscleBodyGeometry.shared).
+//  CPU-side body mesh: baked MakeHuman `body.mesh` (CMB1) plus a procedural
+//  SDF fallback. Vertex muscle IDs follow `MuscleGroup.allCases` order.
+//  Geometry is built once per process; RealityKit recoloring never rebuilds it.
 //
 
 import Foundation
 import simd
 
-struct BodyMesh {
+struct BodyMesh: Sendable {
     var positions: [SIMD3<Float>] = []
     var normals: [SIMD3<Float>] = []
     var indices: [Int32] = []
@@ -26,37 +18,105 @@ struct BodyMesh {
     var muscleIds: [Int16] = []
     /// Per-vertex 0…1 blend toward the muscle color (soft region edges).
     var muscleBlend: [Float] = []
+
+    var vertexCount: Int { positions.count }
+    var triangleCount: Int { indices.count / 3 }
+
+    var bounds: (min: SIMD3<Float>, max: SIMD3<Float>) {
+        guard let first = positions.first else {
+            return (.zero, .zero)
+        }
+        var minP = first
+        var maxP = first
+        for p in positions {
+            minP = simd_min(minP, p)
+            maxP = simd_max(maxP, p)
+        }
+        return (minP, maxP)
+    }
+
+    /// Muscle group for a triangle, or nil for unassigned base body.
+    func muscle(atFace faceIndex: Int) -> MuscleGroup? {
+        guard faceIndex * 3 + 2 < indices.count else { return nil }
+        let all = MuscleGroup.allCases
+        var counts: [Int16: Int] = [:]
+        for i in 0..<3 {
+            let v = Int(indices[faceIndex * 3 + i])
+            guard v >= 0, v < muscleIds.count else { continue }
+            let id = muscleIds[v]
+            if id >= 0 && muscleBlend[v] > 0.35 { counts[id, default: 0] += 1 }
+        }
+        guard let best = counts.max(by: { $0.value < $1.value }), best.value >= 2,
+              Int(best.key) < all.count else { return nil }
+        return all[Int(best.key)]
+    }
+
+    /// Nearest assigned muscle to a local-space point, used when a tap has no face index.
+    func muscle(nearestTo point: SIMD3<Float>) -> MuscleGroup? {
+        let all = MuscleGroup.allCases
+        var bestDistance = Float.greatestFiniteMagnitude
+        var bestID: Int16 = -1
+        for i in 0..<positions.count {
+            let id = muscleIds[i]
+            guard id >= 0, muscleBlend[i] > 0.35 else { continue }
+            let d = simd_length_squared(positions[i] - point)
+            if d < bestDistance {
+                bestDistance = d
+                bestID = id
+            }
+        }
+        guard bestID >= 0, Int(bestID) < all.count else { return nil }
+        return all[Int(bestID)]
+    }
 }
 
-enum MuscleBodyGeometry {
+enum MuscleBodyMeshError: Error, Equatable {
+    case missingResource
+    case invalidHeader
+    case truncated
+    case invalidCounts
+    case muscleIdOutOfRange
+}
+
+enum MuscleBodyMesh {
 
     // MARK: - Cached build
 
-    private static let lock = NSLock()
-    private static var cached: BodyMesh?
+    private final class Cache: @unchecked Sendable {
+        let lock = NSLock()
+        var mesh: BodyMesh?
+    }
+
+    private static let cache = Cache()
 
     /// Blocking accessor — loads on first call (call off-main).
     /// Prefers the baked MakeHuman body (body.mesh, CC0) and falls back to the
     /// procedural SDF figure if the resource is missing or corrupt.
     static func shared() -> BodyMesh {
-        lock.lock(); defer { lock.unlock() }
-        if let cached { return cached }
-        let mesh = loadBakedBody() ?? build()
-        cached = mesh
+        cache.lock.lock(); defer { cache.lock.unlock() }
+        if let mesh = cache.mesh { return mesh }
+        let mesh = (try? loadBakedBody()) ?? build()
+        cache.mesh = mesh
         return mesh
     }
 
-    /// Parse the baked binary ('CMB1', u32 vertCount, u32 indexCount, then
-    /// pos f32*3, normal f32*3, muscleId i16, blend f32, indices u32).
-    private static func loadBakedBody() -> BodyMesh? {
-        guard let url = Bundle.module.url(forResource: "body", withExtension: "mesh"),
-              let data = try? Data(contentsOf: url),
-              data.count > 12, data.prefix(4) == Data("CMB1".utf8) else { return nil }
+    /// Parse and validate the baked binary without constructing RealityKit resources.
+    static func loadBakedBody() throws -> BodyMesh {
+        guard let url = Bundle.module.url(forResource: "body", withExtension: "mesh") else {
+            throw MuscleBodyMeshError.missingResource
+        }
+        let data = try Data(contentsOf: url)
+        return try parse(data)
+    }
+
+    static func parse(_ data: Data) throws -> BodyMesh {
+        guard data.count > 12 else { throw MuscleBodyMeshError.truncated }
+        guard data.prefix(4) == Data("CMB1".utf8) else { throw MuscleBodyMeshError.invalidHeader }
 
         var offset = 4
-        func read<T>(_ type: T.Type, count: Int) -> [T]? {
+        func read<T>(_ type: T.Type, count: Int) throws -> [T] {
             let bytes = count * MemoryLayout<T>.size
-            guard offset + bytes <= data.count else { return nil }
+            guard offset + bytes <= data.count else { throw MuscleBodyMeshError.truncated }
             let out = data.subdata(in: offset..<offset + bytes).withUnsafeBytes {
                 Array($0.bindMemory(to: T.self))
             }
@@ -64,14 +124,21 @@ enum MuscleBodyGeometry {
             return out
         }
 
-        guard let counts = read(UInt32.self, count: 2) else { return nil }
+        let counts = try read(UInt32.self, count: 2)
         let vertCount = Int(counts[0]), indexCount = Int(counts[1])
-        guard vertCount > 0, indexCount > 0,
-              let pos = read(Float32.self, count: vertCount * 3),
-              let nrm = read(Float32.self, count: vertCount * 3),
-              let ids = read(Int16.self, count: vertCount),
-              let blend = read(Float32.self, count: vertCount),
-              let idx = read(UInt32.self, count: indexCount) else { return nil }
+        guard vertCount > 0, indexCount > 0, indexCount % 3 == 0 else {
+            throw MuscleBodyMeshError.invalidCounts
+        }
+        let pos = try read(Float32.self, count: vertCount * 3)
+        let nrm = try read(Float32.self, count: vertCount * 3)
+        let ids = try read(Int16.self, count: vertCount)
+        let blend = try read(Float32.self, count: vertCount)
+        let idx = try read(UInt32.self, count: indexCount)
+
+        let groupCount = MuscleGroup.allCases.count
+        for id in ids where id < -1 || Int(id) >= groupCount {
+            throw MuscleBodyMeshError.muscleIdOutOfRange
+        }
 
         var mesh = BodyMesh()
         mesh.positions = (0..<vertCount).map {
