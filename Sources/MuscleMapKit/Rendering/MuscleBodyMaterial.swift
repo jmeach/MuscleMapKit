@@ -88,6 +88,12 @@ enum MuscleBodyMaterial {
         }
     }
 
+    /// `MuscleGroup.allCases`-ordered selection flags, matching `groupColors`
+    /// and the per-vertex `muscleIds` encoding.
+    static func groupSelection(_ selected: Set<MuscleGroup>) -> [Bool] {
+        MuscleGroup.allCases.map { selected.contains($0) }
+    }
+
     /// Per-vertex mix of the graphite base and the group intensity color.
     static func vertexColors(
         mesh: BodyMesh,
@@ -108,6 +114,13 @@ enum MuscleBodyMaterial {
         return colors
     }
 
+    /// Writes `rgb` = the rendered anatomy/work color and `w` = the selected-muscle
+    /// mask consumed by `muscleMapSurface`.
+    ///
+    /// The fourth component is a private data channel, not opacity: the material is
+    /// opaque and the shader only ever reads `w` as the selection mask. Selected
+    /// vertices carry `muscleBlend` so the halo follows the same soft anatomical
+    /// edges as the color regions; everything else carries `0`.
     static func writeVertexColors(
         to buffer: UnsafeMutableBufferPointer<SIMD4<Float>>,
         mesh: BodyMesh,
@@ -116,15 +129,20 @@ enum MuscleBodyMaterial {
         style: MuscleBodyStyle
     ) {
         let groupColor = groupColors(intensities: intensities, selected: selected, style: style)
+        let groupIsSelected = groupSelection(selected)
         let count = min(buffer.count, mesh.positions.count)
         for v in 0..<count {
             let id = mesh.muscleIds[v]
             guard id >= 0, Int(id) < groupColor.count else {
-                buffer[v] = style.baseColor
+                var base = style.baseColor
+                base.w = 0
+                buffer[v] = base
                 continue
             }
             let blend = mesh.muscleBlend[v]
-            buffer[v] = simd_mix(style.baseColor, groupColor[Int(id)], SIMD4(repeating: blend))
+            var color = simd_mix(style.baseColor, groupColor[Int(id)], SIMD4(repeating: blend))
+            color.w = groupIsSelected[Int(id)] ? blend : 0
+            buffer[v] = color
         }
     }
 

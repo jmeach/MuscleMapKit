@@ -21,6 +21,9 @@ final class MuscleBodyEntity {
     private var lastStyle: MuscleBodyStyle?
     private var attached = false
     private var cameraEntity: PerspectiveCamera?
+    private var framing: MuscleBodyFraming?
+    /// Camera-distance magnification. `1` is the bounds-fitted full-body shot.
+    private(set) var zoomScale: Float = 1
 
     init() {
         root.addChild(body)
@@ -118,40 +121,37 @@ final class MuscleBodyEntity {
         cpuMesh?.muscle(nearestTo: point)
     }
 
-    func pulseSelection() {
-        let up = SIMD3<Float>(repeating: 1.025)
-        let rest = SIMD3<Float>(repeating: 1)
-        if #available(iOS 26.0, *) {
-            Entity.animate(.easeOut(duration: 0.10), body: { [body] in
-                body.scale = up
-            }, completion: { [body] in
-                Entity.animate(.easeOut(duration: 0.26), body: {
-                    body.scale = rest
-                })
-            })
-        } else {
-            body.scale = rest
-        }
-    }
-
     // MARK: - Camera
 
     func installCamera(bounds: MeshBounds) {
-        let framing = MuscleBodyFraming.fit(bounds: bounds)
-        framingTarget.position = framing.lookAt
-        if let cameraEntity {
-            cameraEntity.look(at: framing.lookAt, from: framing.cameraPosition, relativeTo: nil)
-            return
+        let fitted = MuscleBodyFraming.fit(bounds: bounds)
+        framing = fitted
+        framingTarget.position = fitted.lookAt
+        if cameraEntity == nil {
+            let camera = PerspectiveCamera()
+            camera.camera = PerspectiveCameraComponent(
+                near: fitted.near,
+                far: fitted.far,
+                fieldOfViewInDegrees: fitted.fieldOfViewDegrees
+            )
+            root.addChild(camera)
+            cameraEntity = camera
         }
-        let camera = PerspectiveCamera()
-        camera.camera = PerspectiveCameraComponent(
-            near: framing.near,
-            far: framing.far,
-            fieldOfViewInDegrees: framing.fieldOfViewDegrees
+        applyZoom(zoomScale)
+    }
+
+    /// Move the existing camera along its original view ray. Zoom deliberately
+    /// does not scale `body`: entity scale would ride along with yaw, inertia,
+    /// collision geometry, and the ground shadow.
+    func applyZoom(_ scale: Float) {
+        let clamped = MuscleBodyFraming.clampZoom(scale)
+        zoomScale = clamped
+        guard let framing, let cameraEntity else { return }
+        cameraEntity.look(
+            at: framing.lookAt,
+            from: framing.cameraPosition(zoom: clamped),
+            relativeTo: nil
         )
-        camera.look(at: framing.lookAt, from: framing.cameraPosition, relativeTo: nil)
-        root.addChild(camera)
-        cameraEntity = camera
     }
 
     // MARK: - Mesh construction

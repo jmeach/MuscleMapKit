@@ -28,6 +28,14 @@ struct MuscleBodyFraming: Equatable, Sendable {
     static let defaultNear: Float = 0.1
     static let defaultFar: Float = 20
 
+    /// Zoom is a camera-distance multiplier, not an entity scale. `1` is the
+    /// bounds-fitted full-body framing and doubles as the minimum: the map never
+    /// pulls back farther than the shot it was designed around.
+    static let minZoom: Float = 1
+    /// Enough magnification to inspect a small group (forearms, calves) without
+    /// the near plane or the mesh interior coming into view.
+    static let maxZoom: Float = 2.75
+
     var fieldOfViewRadians: Float {
         fieldOfViewDegrees * .pi / 180
     }
@@ -103,6 +111,27 @@ struct MuscleBodyFraming: Equatable, Sendable {
 
     func containsBounds(_ bounds: MeshBounds, yaw: Float, epsilon: Float = 1e-4) -> Bool {
         bounds.corners.allSatisfy { contains(Self.yawed($0, angle: yaw), epsilon: epsilon) }
+    }
+
+    // MARK: - Zoom
+
+    /// Clamps to the supported magnification range. Non-finite input (a gesture
+    /// producing NaN) falls back to the default framing rather than losing the camera.
+    static func clampZoom(_ zoom: Float) -> Float {
+        guard zoom.isFinite else { return minZoom }
+        return Swift.min(Swift.max(zoom, minZoom), maxZoom)
+    }
+
+    /// Camera distance from `lookAt` at `zoom`. The viewing direction, field of
+    /// view, and near/far planes are unchanged; only the distance shortens.
+    func distance(zoom: Float) -> Float {
+        distance / Self.clampZoom(zoom)
+    }
+
+    /// Camera position at `zoom`, moved along the original view ray toward `lookAt`.
+    func cameraPosition(zoom: Float) -> SIMD3<Float> {
+        let direction = cameraPosition - lookAt
+        return lookAt + direction / Self.clampZoom(zoom)
     }
 
     private static func yawed(_ point: SIMD3<Float>, angle: Float) -> SIMD3<Float> {

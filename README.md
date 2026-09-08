@@ -53,9 +53,11 @@ MuscleBody3DView(
 
 ### Inside a scrolling list
 
-Horizontal drags rotate the body. Vertical-dominant drags are ignored so a
-parent `ScrollView` can keep scrolling. Pass `interactive: false` only when the
-map must not handle gestures at all:
+Horizontal drags rotate the body. Pinch zooms the camera in toward the figure,
+up to 2.75x, and pinching back out returns to the fitted full-body framing; the
+zoom persists until the user changes it. Vertical-dominant drags are ignored so
+a parent `ScrollView` can keep scrolling. Pass `interactive: false` only when
+the map must not handle gestures at all:
 
 ```swift
 MuscleBody3DView(
@@ -67,7 +69,7 @@ MuscleBody3DView(
 ```
 
 Reduce Motion disables idle spin and inertial flick while leaving direct
-rotation available.
+manipulation — rotation and pinch zoom — available.
 
 ## Turning exercises into muscles
 

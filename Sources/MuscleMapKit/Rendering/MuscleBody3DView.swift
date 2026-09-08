@@ -7,8 +7,9 @@ import SwiftUI
 /// mutated in place via the color vertex buffer. An explicit perspective camera
 /// frames the mesh bounds so the full figure stays visible. Drag horizontally
 /// to yaw. Vertical drags are ignored so a parent `ScrollView` can keep
-/// scrolling. Pass `interactive: false` only when the map must not handle
-/// gestures at all.
+/// scrolling. Pinch magnifies by moving that camera toward the body; the zoom
+/// persists until the user pinches back out. Pass `interactive: false` only
+/// when the map must not handle gestures at all.
 public struct MuscleBody3DView: View {
     var intensities: [MuscleGroup: Double]
     var selected: Set<MuscleGroup> = []
@@ -84,6 +85,7 @@ public struct MuscleBody3DView: View {
         .modifier(FlexibleRealityLayout())
         .contentShape(Rectangle())
         .simultaneousGesture(dragGesture, including: interactive ? .all : .none)
+        .simultaneousGesture(magnifyGesture, including: interactive ? .all : .none)
         .simultaneousGesture(tapGesture, including: interactive ? .all : .none)
         .onChange(of: scenePhase) { _, phase in
             if phase != .active {
@@ -129,14 +131,37 @@ public struct MuscleBody3DView: View {
             }
     }
 
+    private var magnifyGesture: some Gesture {
+        MagnifyGesture(minimumScaleDelta: 0.01)
+            .onChanged { value in
+                if session.interaction.isMagnifying == false {
+                    session.interaction.beginMagnification(body: session.model.body)
+                }
+                session.model.applyZoom(
+                    session.interaction.updateMagnification(value.magnification)
+                )
+            }
+            .onEnded { _ in
+                // `dragBegan` is left alone: a one-finger drag that outlives the
+                // pinch keeps its translation baseline, so releasing a finger
+                // cannot snap the body into a new yaw.
+                session.interaction.endMagnification(
+                    body: session.model.body,
+                    autoRotate: autoRotate,
+                    reduceMotion: reduceMotion
+                )
+            }
+    }
+
     private var tapGesture: some Gesture {
         SpatialTapGesture()
             .targetedToAnyEntity()
             .onEnded { value in
+                // A two-finger pinch must never resolve as a selection tap.
+                guard session.interaction.isMagnifying == false else { return }
                 session.interaction.stopIdle(body: session.model.body)
                 let muscle = muscleFromHit(value)
                 guard let muscle else { return }
-                session.model.pulseSelection()
                 onTapMuscle?(muscle)
                 session.interaction.scheduleIdle(
                     body: session.model.body,

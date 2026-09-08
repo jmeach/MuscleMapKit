@@ -3,6 +3,16 @@
 
 using namespace metal;
 
+/// Selected-muscle halo color. Close to `MuscleBodyStyle.selectedColor` in both
+/// palettes so selection reads as a brighter member of the existing red family
+/// rather than a new hue.
+constant half3 kSelectionTint = half3(1.0h, 0.22h, 0.18h);
+/// Flat glow across the selected region so front-facing geometry still reads as
+/// selected where the silhouette rim is weak.
+constant half kSelectionInterior = 0.20h;
+/// Edge halo along the selected region's silhouette and contours.
+constant half kSelectionRim = 0.85h;
+
 /// Surface shader for the continuous muscle body.
 ///
 /// Interpolated vertex colors already mix graphite, idle anatomy, and the
@@ -10,11 +20,17 @@ using namespace metal;
 /// exceeds the simulator's 31 texture-binding limit, so this shader runs as
 /// an unlit CustomMaterial and reconstructs the three-light wrap plus the
 /// original red-dominant emissive glow in `set_emissive_color`.
+///
+/// The vertex color's fourth component is a private data channel, not opacity:
+/// `MuscleBodyMaterial.writeVertexColors` writes the selected-muscle mask there.
+/// The selection halo derives only from that mask, so an intensely worked but
+/// unselected muscle never looks selected.
 [[visible]]
 void muscleMapSurface(realitykit::surface_parameters params)
 {
     float4 vertexColor = params.geometry().color();
     half3 color = half3(vertexColor.xyz);
+    half selection = half(saturate(vertexColor.w));
 
     params.surface().set_base_color(color);
     params.surface().set_roughness(0.48h);
@@ -32,5 +48,14 @@ void muscleMapSurface(realitykit::surface_parameters params)
 
     half redness = color.r - max(color.g, color.b);
     half glow = clamp(redness * 1.5h, 0.0h, 0.55h);
-    params.surface().set_emissive_color(shaded + color * glow);
+    half3 emissive = shaded + color * glow;
+
+    if (selection > 0.0h) {
+        float3 viewDirection = normalize(params.geometry().view_direction());
+        half fresnel = half(pow(saturate(1.0 - abs(dot(n, viewDirection))), 2.0));
+        half halo = selection * (kSelectionInterior + fresnel * kSelectionRim);
+        emissive += kSelectionTint * halo;
+    }
+
+    params.surface().set_emissive_color(emissive);
 }

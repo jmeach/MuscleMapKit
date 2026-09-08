@@ -217,6 +217,249 @@ final class MuscleBodyRenderingTests: XCTestCase {
         XCTAssertEqual(colorCount, mesh.vertexCount)
     }
 
+    // MARK: - Selection mask
+
+    /// Vertex color `w` is a private data channel — the selected-muscle mask the
+    /// Metal surface shader turns into a localized halo — never surface opacity.
+    func testUnselectedBodyEncodesAZeroSelectionChannel() throws {
+        let mesh = try bakedMesh()
+        let colors = MuscleBodyMaterial.vertexColors(
+            mesh: mesh,
+            intensities: [.chest: 1, .quads: 0.6],
+            selected: [],
+            style: .dark
+        )
+        for i in 0..<mesh.vertexCount {
+            XCTAssertEqual(colors[i].w, 0, accuracy: 1e-6, "vertex \(i) claimed selection with nothing selected")
+        }
+    }
+
+    func testSelectedMuscleVerticesEncodeMuscleBlendAsTheSelectionMask() throws {
+        let mesh = try bakedMesh()
+        let colors = MuscleBodyMaterial.vertexColors(
+            mesh: mesh,
+            intensities: [.chest: 0.4],
+            selected: [.chest],
+            style: .dark
+        )
+        var sawStrongMask = false
+        for i in 0..<mesh.vertexCount where mesh.muscleIds[i] == Int16(MuscleGroup.chest.meshIndex) {
+            XCTAssertEqual(
+                colors[i].w,
+                mesh.muscleBlend[i],
+                accuracy: 1e-6,
+                "halo must follow the same soft edges as the color regions"
+            )
+            if mesh.muscleBlend[i] > 0.8 { sawStrongMask = true }
+        }
+        XCTAssertTrue(sawStrongMask, "chest should have fully-inside vertices")
+    }
+
+    func testSelectionLeavesOtherGroupsAndBaseBodyUnmasked() throws {
+        let mesh = try bakedMesh()
+        let colors = MuscleBodyMaterial.vertexColors(
+            mesh: mesh,
+            intensities: [.chest: 0.4, .quads: 1.0],
+            selected: [.chest],
+            style: .dark
+        )
+        var sawBase = false
+        var sawOtherMuscle = false
+        for i in 0..<mesh.vertexCount {
+            let id = mesh.muscleIds[i]
+            if id < 0 {
+                XCTAssertEqual(colors[i].w, 0, accuracy: 1e-6)
+                sawBase = true
+            } else if id != Int16(MuscleGroup.chest.meshIndex) {
+                XCTAssertEqual(colors[i].w, 0, accuracy: 1e-6, "only the selected group carries a mask")
+                sawOtherMuscle = true
+            }
+        }
+        XCTAssertTrue(sawBase)
+        XCTAssertTrue(sawOtherMuscle)
+    }
+
+    func testSelectingAnotherMuscleMovesTheMask() throws {
+        let mesh = try bakedMesh()
+        let chest = MuscleBodyMaterial.vertexColors(
+            mesh: mesh,
+            intensities: [.chest: 0.4, .quads: 0.4],
+            selected: [.chest],
+            style: .dark
+        )
+        let quads = MuscleBodyMaterial.vertexColors(
+            mesh: mesh,
+            intensities: [.chest: 0.4, .quads: 0.4],
+            selected: [.quads],
+            style: .dark
+        )
+        var checkedChest = false
+        var checkedQuads = false
+        for i in 0..<mesh.vertexCount {
+            guard mesh.muscleBlend[i] > 0.8 else { continue }
+            if mesh.muscleIds[i] == Int16(MuscleGroup.chest.meshIndex) {
+                XCTAssertGreaterThan(chest[i].w, 0.8)
+                XCTAssertEqual(quads[i].w, 0, accuracy: 1e-6)
+                checkedChest = true
+            } else if mesh.muscleIds[i] == Int16(MuscleGroup.quads.meshIndex) {
+                XCTAssertEqual(chest[i].w, 0, accuracy: 1e-6)
+                XCTAssertGreaterThan(quads[i].w, 0.8)
+                checkedQuads = true
+            }
+        }
+        XCTAssertTrue(checkedChest)
+        XCTAssertTrue(checkedQuads)
+    }
+
+    func testSelectionDoesNotDisturbAnotherGroupsIntensityColor() throws {
+        let mesh = try bakedMesh()
+        let intensities: [MuscleGroup: Double] = [.chest: 0.4, .quads: 1.0]
+        let plain = MuscleBodyMaterial.vertexColors(
+            mesh: mesh,
+            intensities: intensities,
+            selected: [],
+            style: .dark
+        )
+        let selected = MuscleBodyMaterial.vertexColors(
+            mesh: mesh,
+            intensities: intensities,
+            selected: [.chest],
+            style: .dark
+        )
+        var compared = false
+        for i in 0..<mesh.vertexCount where mesh.muscleIds[i] == Int16(MuscleGroup.quads.meshIndex) {
+            XCTAssertEqual(selected[i].x, plain[i].x, accuracy: 1e-6)
+            XCTAssertEqual(selected[i].y, plain[i].y, accuracy: 1e-6)
+            XCTAssertEqual(selected[i].z, plain[i].z, accuracy: 1e-6)
+            compared = true
+        }
+        XCTAssertTrue(compared)
+    }
+
+    func testSelectedGroupKeepsItsIntensityColorInRGB() throws {
+        let mesh = try bakedMesh()
+        let style = MuscleBodyStyle.dark
+        let colors = MuscleBodyMaterial.vertexColors(
+            mesh: mesh,
+            intensities: [.chest: 1.0],
+            selected: [.chest],
+            style: style
+        )
+        let target = style.color(for: 1.0, selected: true)
+        var compared = false
+        for i in 0..<mesh.vertexCount {
+            guard mesh.muscleIds[i] == Int16(MuscleGroup.chest.meshIndex),
+                  mesh.muscleBlend[i] > 0.9 else { continue }
+            XCTAssertEqual(colors[i].x, target.x, accuracy: 0.05)
+            XCTAssertGreaterThan(colors[i].x, colors[i].y, "selected work color stays red-dominant")
+            compared = true
+            break
+        }
+        XCTAssertTrue(compared)
+    }
+
+    @MainActor
+    func testApplyRewritesTheSelectionChannelInPlace() throws {
+        let entity = MuscleBodyEntity()
+        try entity.attachCachedMesh(intensities: [.chest: 0.5], selected: [], style: .dark)
+        let mesh = try bakedMesh()
+        let lowLevel = try XCTUnwrap(entity.lowLevelMesh)
+        let modelMesh = try XCTUnwrap(entity.body.components[ModelComponent.self]).mesh
+
+        func selectionMask() -> [Float] {
+            var mask: [Float] = []
+            lowLevel.withUnsafeBytes(bufferIndex: MuscleBodyEntity.colorBufferIndex) { raw in
+                let buffer = raw.bindMemory(to: SIMD4<Float>.self)
+                mask = (0..<buffer.count).map { buffer[$0].w }
+            }
+            return mask
+        }
+
+        XCTAssertEqual(selectionMask().max() ?? 1, 0, accuracy: 1e-6)
+
+        entity.apply(intensities: [.chest: 0.5], selected: [.chest], style: .dark)
+        let selectedMask = selectionMask()
+        XCTAssertGreaterThan(selectedMask.max() ?? 0, 0.8)
+        for i in 0..<min(selectedMask.count, mesh.vertexCount)
+        where mesh.muscleIds[i] != Int16(MuscleGroup.chest.meshIndex) {
+            XCTAssertEqual(selectedMask[i], 0, accuracy: 1e-6)
+        }
+
+        // Selection is a rendering-state update: same mesh buffer, same resource.
+        XCTAssertTrue(entity.lowLevelMesh === lowLevel)
+        let modelMeshAfter = try XCTUnwrap(entity.body.components[ModelComponent.self]).mesh
+        XCTAssertTrue(modelMeshAfter === modelMesh, "recoloring must not swap the mesh resource")
+    }
+
+    // MARK: - Camera zoom
+
+    func testDefaultZoomIsTheFittedCamera() throws {
+        let framing = MuscleBodyFraming.fit(bounds: try bakedMesh().bounds)
+        let position = framing.cameraPosition(zoom: 1)
+        XCTAssertEqual(position.x, framing.cameraPosition.x, accuracy: 1e-5)
+        XCTAssertEqual(position.y, framing.cameraPosition.y, accuracy: 1e-5)
+        XCTAssertEqual(position.z, framing.cameraPosition.z, accuracy: 1e-5)
+        XCTAssertEqual(framing.distance(zoom: 1), framing.distance, accuracy: 1e-5)
+    }
+
+    func testZoomingInShortensCameraDistanceAlongTheSameViewRay() throws {
+        let framing = MuscleBodyFraming.fit(bounds: try bakedMesh().bounds)
+        var previous = framing.distance
+        for zoom in [Float(1.25), 1.8, 2.5] {
+            let distance = framing.distance(zoom: zoom)
+            XCTAssertLessThan(distance, previous)
+            XCTAssertEqual(distance, framing.distance / zoom, accuracy: 1e-5)
+            let position = framing.cameraPosition(zoom: zoom)
+            XCTAssertEqual(position.x, framing.lookAt.x, accuracy: 1e-5, "view ray must not tilt")
+            XCTAssertEqual(position.y, framing.lookAt.y, accuracy: 1e-5)
+            XCTAssertGreaterThan(position.z, framing.lookAt.z)
+            previous = distance
+        }
+    }
+
+    func testZoomClampsToTheSupportedRange() throws {
+        let framing = MuscleBodyFraming.fit(bounds: try bakedMesh().bounds)
+        XCTAssertEqual(MuscleBodyFraming.clampZoom(0.2), MuscleBodyFraming.minZoom, accuracy: 1e-6)
+        XCTAssertEqual(MuscleBodyFraming.clampZoom(50), MuscleBodyFraming.maxZoom, accuracy: 1e-6)
+        XCTAssertEqual(MuscleBodyFraming.clampZoom(.nan), MuscleBodyFraming.minZoom, accuracy: 1e-6)
+        XCTAssertEqual(
+            framing.distance(zoom: 0.4),
+            framing.distance,
+            accuracy: 1e-5,
+            "the fitted full-body shot is the minimum zoom"
+        )
+        XCTAssertEqual(
+            framing.distance(zoom: 99),
+            framing.distance / MuscleBodyFraming.maxZoom,
+            accuracy: 1e-5
+        )
+    }
+
+    func testMaximumZoomStaysOutsideTheNearPlaneAndNeverReachesTheLookAt() throws {
+        let bounds = try bakedMesh().bounds
+        let framing = MuscleBodyFraming.fit(bounds: bounds)
+        let closest = framing.distance(zoom: MuscleBodyFraming.maxZoom)
+        XCTAssertGreaterThan(closest, 0)
+        // The camera must clear both the near plane and the front of the torso.
+        XCTAssertGreaterThan(closest - bounds.extent.z * 0.5, framing.near)
+        XCTAssertNotEqual(framing.cameraPosition(zoom: MuscleBodyFraming.maxZoom).z, framing.lookAt.z)
+    }
+
+    @MainActor
+    func testEntityZoomIsClampedAndPersisted() throws {
+        let entity = MuscleBodyEntity()
+        try entity.attachCachedMesh(intensities: [.chest: 1], selected: [], style: .dark)
+        XCTAssertEqual(entity.zoomScale, MuscleBodyFraming.minZoom, accuracy: 1e-6)
+        entity.applyZoom(2.0)
+        XCTAssertEqual(entity.zoomScale, 2.0, accuracy: 1e-6)
+        entity.applyZoom(99)
+        XCTAssertEqual(entity.zoomScale, MuscleBodyFraming.maxZoom, accuracy: 1e-6)
+        entity.applyZoom(0.1)
+        XCTAssertEqual(entity.zoomScale, MuscleBodyFraming.minZoom, accuracy: 1e-6)
+        // Zoom must not scale the body: yaw, inertia, and collision ride on that transform.
+        XCTAssertEqual(entity.body.scale, SIMD3<Float>(repeating: 1))
+    }
+
     // MARK: - Metal
 
     func testMetalLibraryLoadsFromThePackageBundle() throws {

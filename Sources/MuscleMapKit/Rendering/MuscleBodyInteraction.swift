@@ -3,11 +3,17 @@ import RealityKit
 import simd
 import SwiftUI
 
-/// Rotation / idle-spin policy for `MuscleBody3DView`.
+/// Rotation / zoom / idle-spin policy for `MuscleBody3DView`.
 ///
 /// Horizontal drag rotates yaw. Vertical-dominant drags are ignored so a parent
-/// `ScrollView` can keep scrolling. Reduce Motion disables idle spin and inertia
-/// but leaves direct yaw changes available.
+/// `ScrollView` can keep scrolling. Pinch magnifies, and wins over yaw for as
+/// long as it is active because a two-finger centroid also moves horizontally.
+/// Reduce Motion disables idle spin and inertia but leaves direct manipulation —
+/// yaw and zoom — available.
+///
+/// Zoom is kept here as a plain scalar; `MuscleBody3DView` hands it to
+/// `MuscleBodyEntity.applyZoom(_:)`, so this type stays free of camera and
+/// entity-tree knowledge.
 @MainActor
 final class MuscleBodyInteraction {
     private(set) var yaw: Float
@@ -17,6 +23,12 @@ final class MuscleBodyInteraction {
     private var idleWorkItem: DispatchWorkItem?
     private var idleController: AnimationPlaybackController?
     private var inertiaController: AnimationPlaybackController?
+
+    /// Camera-distance magnification, `1` = the default bounds-fitted framing.
+    /// Persists across gestures: zoom is only reset by pinching back to `1`.
+    private(set) var zoomScale: Float = MuscleBodyFraming.minZoom
+    private(set) var isMagnifying = false
+    private var magnificationOrigin: Float = MuscleBodyFraming.minZoom
 
     private enum AxisLock {
         case undecided
@@ -43,6 +55,14 @@ final class MuscleBodyInteraction {
 
     /// Returns `true` when this drag is rotating the body.
     func updateDrag(translation: CGSize, body: Entity) -> Bool {
+        // A live pinch moves its centroid too. Track the translation so the
+        // axis decision restarts from where the fingers actually are, but never
+        // yaw while magnifying.
+        guard !isMagnifying else {
+            lastTranslation = translation
+            axis = .undecided
+            return false
+        }
         if axis == .undecided {
             let dx = abs(translation.width)
             let dy = abs(translation.height)
@@ -51,6 +71,11 @@ final class MuscleBodyInteraction {
                 return false
             }
             axis = dx > dy * 1.15 ? .horizontal : .vertical
+            // Rebase on the deciding frame. A drag that only becomes a drag
+            // after a pinch (or one that arrives already displaced) would
+            // otherwise convert its whole accumulated translation into yaw.
+            lastTranslation = translation
+            return false
         }
         guard axis == .horizontal else {
             lastTranslation = translation
@@ -73,6 +98,10 @@ final class MuscleBodyInteraction {
         defer {
             axis = .undecided
             lastTranslation = .zero
+        }
+        guard !isMagnifying else {
+            scheduleIdle(body: body, autoRotate: autoRotate, reduceMotion: reduceMotion, after: 3)
+            return
         }
         guard axis == .horizontal else {
             scheduleIdle(body: body, autoRotate: autoRotate, reduceMotion: reduceMotion, after: 3)
@@ -105,6 +134,41 @@ final class MuscleBodyInteraction {
 
     func isTap(translation: CGSize) -> Bool {
         hypot(translation.width, translation.height) < 10
+    }
+
+    // MARK: - Magnification
+
+    /// Pinch start: direct manipulation, so idle spin and inertia stop and any
+    /// in-flight drag stops rotating.
+    func beginMagnification(body: Entity) {
+        stopIdle(body: body)
+        inertiaController?.stop()
+        inertiaController = nil
+        isMagnifying = true
+        magnificationOrigin = zoomScale
+        axis = .undecided
+        lastTranslation = .zero
+    }
+
+    /// Applies a `MagnifyGesture` magnification, which is relative to the start
+    /// of the current pinch, on top of the zoom the user already had. Returns
+    /// the clamped zoom to hand to the camera.
+    @discardableResult
+    func updateMagnification(_ magnification: CGFloat) -> Float {
+        let requested = magnificationOrigin * Float(magnification)
+        zoomScale = MuscleBodyFraming.clampZoom(requested)
+        return zoomScale
+    }
+
+    /// Pinch end: the zoom persists, and idle spin resumes on the same delay as
+    /// any other direct manipulation. The camera is never animated back to the
+    /// default framing.
+    func endMagnification(body: Entity, autoRotate: Bool, reduceMotion: Bool) {
+        isMagnifying = false
+        magnificationOrigin = zoomScale
+        axis = .undecided
+        lastTranslation = .zero
+        scheduleIdle(body: body, autoRotate: autoRotate, reduceMotion: reduceMotion, after: 3)
     }
 
     func scheduleIdle(
