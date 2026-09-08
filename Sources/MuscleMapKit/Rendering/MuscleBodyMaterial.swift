@@ -148,12 +148,10 @@ enum MuscleBodyMaterial {
         let shader = CustomMaterial.SurfaceShader(named: surfaceShaderName, in: library)
         let material: CustomMaterial
         do {
-            var pbr = PhysicallyBasedMaterial()
-            pbr.baseColor = .init(tint: .white)
-            pbr.roughness = .init(floatLiteral: roughness)
-            pbr.metallic = .init(floatLiteral: metallic)
-            pbr.faceCulling = .none
-            var created = try CustomMaterial(from: pbr, surfaceShader: shader)
+            // `.lit` CustomMaterial pipelines bind more texture slots than the
+            // iOS Simulator GPU allows (index 31 > 30). Unlit still runs the
+            // Metal surface shader; lighting and red glow are computed there.
+            var created = try CustomMaterial(surfaceShader: shader, lightingModel: .unlit)
             created.roughness = .init(floatLiteral: roughness)
             created.metallic = .init(floatLiteral: metallic)
             created.faceCulling = .none

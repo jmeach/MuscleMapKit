@@ -236,7 +236,7 @@ final class MuscleBodyRenderingTests: XCTestCase {
     @MainActor
     func testCustomMaterialCanBeConstructedFromThePackageShader() throws {
         let material = try MuscleBodyMaterial.makeSurfaceMaterial()
-        XCTAssertEqual(material.lightingModel, .lit)
+        XCTAssertEqual(material.lightingModel, .unlit)
         XCTAssertEqual(material.roughness.scale, MuscleBodyMaterial.roughness, accuracy: 0.001)
         XCTAssertEqual(material.metallic.scale, MuscleBodyMaterial.metallic, accuracy: 0.001)
         XCTAssertEqual(material.faceCulling, .none)
