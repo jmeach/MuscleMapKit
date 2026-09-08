@@ -3,28 +3,35 @@ import RealityKit
 import simd
 import UIKit
 
-/// Owns one RealityKit body instance. Geometry is copied from the process-wide
-/// CPU mesh once; later intensity/selection changes replace a tiny color ramp
-/// texture without rebuilding the mesh.
+/// Owns one RealityKit body instance. Geometry and collision are built once;
+/// later intensity/selection changes rewrite only the per-vertex color buffer.
 @MainActor
 final class MuscleBodyEntity {
     let root = Entity()
     let body = Entity()
+    /// Empty entity at the mesh visual center. Used as the camera look-at so
+    /// framing is independent of the body's foot-origin transform.
+    let framingTarget = Entity()
 
+    private(set) var lowLevelMesh: LowLevelMesh?
     private var meshResource: MeshResource?
     private var cpuMesh: BodyMesh?
     private var lastIntensities: [MuscleGroup: Double] = [:]
     private var lastSelected: Set<MuscleGroup> = []
     private var lastStyle: MuscleBodyStyle?
     private var attached = false
+    private var cameraEntity: PerspectiveCamera?
 
     init() {
         root.addChild(body)
+        root.addChild(framingTarget)
         MuscleBodyEntity.addLights(to: root)
         MuscleBodyEntity.addGroundShadow(to: root)
     }
 
     var isMeshAttached: Bool { attached }
+
+    var meshBounds: MeshBounds? { cpuMesh?.bounds }
 
     /// Build RealityKit resources from the cached CPU mesh. Safe to call once.
     func attachCachedMesh(
@@ -40,21 +47,24 @@ final class MuscleBodyEntity {
         let mesh = MuscleBodyMesh.shared()
         cpuMesh = mesh
         let clamped = MuscleIntensity.clamped(intensities)
-        let texture = try MuscleBodyMaterial.makeRampTexture(
+        let colors = MuscleBodyMaterial.vertexColors(
+            mesh: mesh,
             intensities: clamped,
             selected: selected,
             style: style
         )
-        let material = MuscleBodyMaterial.makeSurfaceMaterial(texture: texture)
-        let lowLevel = try Self.makeLowLevelMesh(from: mesh)
+        let material = try MuscleBodyMaterial.makeSurfaceMaterial()
+        let lowLevel = try Self.makeLowLevelMesh(from: mesh, colors: colors)
         let resource = try MeshResource(from: lowLevel)
         body.components.set(ModelComponent(mesh: resource, materials: [material]))
 
+        lowLevelMesh = lowLevel
         meshResource = resource
         lastIntensities = clamped
         lastSelected = selected
         lastStyle = style
         attached = true
+        installCamera(bounds: mesh.bounds)
 
         let attachedResource = resource
         Task { [weak body] in
@@ -87,16 +97,17 @@ final class MuscleBodyEntity {
         lastIntensities = clamped
         lastSelected = selected
         lastStyle = style
-        guard let texture = try? MuscleBodyMaterial.makeRampTexture(
-            intensities: clamped,
-            selected: selected,
-            style: style
-        ),
-              var model = body.components[ModelComponent.self] else {
-            return
+        guard let mesh = cpuMesh, let lowLevelMesh else { return }
+        lowLevelMesh.replaceUnsafeMutableBytes(bufferIndex: Self.colorBufferIndex) { raw in
+            let buffer = raw.bindMemory(to: SIMD4<Float>.self)
+            MuscleBodyMaterial.writeVertexColors(
+                to: buffer,
+                mesh: mesh,
+                intensities: clamped,
+                selected: selected,
+                style: style
+            )
         }
-        model.materials = [MuscleBodyMaterial.makeSurfaceMaterial(texture: texture)]
-        body.components.set(model)
     }
 
     func muscle(atFace faceIndex: Int) -> MuscleGroup? {
@@ -123,38 +134,78 @@ final class MuscleBodyEntity {
         }
     }
 
-    // MARK: - Mesh construction
+    // MARK: - Camera
 
-    private struct StaticVertex {
-        var position: SIMD3<Float>
-        var normal: SIMD3<Float>
-        var uv: SIMD2<Float>
+    func installCamera(bounds: MeshBounds) {
+        let framing = MuscleBodyFraming.fit(bounds: bounds)
+        framingTarget.position = framing.lookAt
+        if let cameraEntity {
+            cameraEntity.look(at: framing.lookAt, from: framing.cameraPosition, relativeTo: nil)
+            return
+        }
+        let camera = PerspectiveCamera()
+        camera.camera = PerspectiveCameraComponent(
+            near: framing.near,
+            far: framing.far,
+            fieldOfViewInDegrees: framing.fieldOfViewDegrees
+        )
+        camera.look(at: framing.lookAt, from: framing.cameraPosition, relativeTo: nil)
+        root.addChild(camera)
+        cameraEntity = camera
     }
 
-    private static func makeLowLevelMesh(from mesh: BodyMesh) throws -> LowLevelMesh {
+    // MARK: - Mesh construction
+
+    static let geometryBufferIndex = 0
+    static let colorBufferIndex = 1
+
+    struct GeometryVertex {
+        var position: SIMD3<Float>
+        var normal: SIMD3<Float>
+    }
+
+    static func makeLowLevelMesh(from mesh: BodyMesh, colors: [SIMD4<Float>]) throws -> LowLevelMesh {
         var descriptor = LowLevelMesh.Descriptor()
         descriptor.vertexCapacity = mesh.positions.count
         descriptor.indexCapacity = mesh.indices.count
         descriptor.indexType = .uint32
         descriptor.vertexAttributes = [
-            .init(semantic: .position, format: .float3, layoutIndex: 0, offset: MemoryLayout<StaticVertex>.offset(of: \.position)!),
-            .init(semantic: .normal, format: .float3, layoutIndex: 0, offset: MemoryLayout<StaticVertex>.offset(of: \.normal)!),
-            .init(semantic: .uv0, format: .float2, layoutIndex: 0, offset: MemoryLayout<StaticVertex>.offset(of: \.uv)!),
+            .init(
+                semantic: .position,
+                format: .float3,
+                layoutIndex: geometryBufferIndex,
+                offset: MemoryLayout<GeometryVertex>.offset(of: \.position)!
+            ),
+            .init(
+                semantic: .normal,
+                format: .float3,
+                layoutIndex: geometryBufferIndex,
+                offset: MemoryLayout<GeometryVertex>.offset(of: \.normal)!
+            ),
+            .init(
+                semantic: .color,
+                format: .float4,
+                layoutIndex: colorBufferIndex,
+                offset: 0
+            ),
         ]
         descriptor.vertexLayouts = [
-            .init(bufferIndex: 0, bufferStride: MemoryLayout<StaticVertex>.stride)
+            .init(bufferIndex: geometryBufferIndex, bufferStride: MemoryLayout<GeometryVertex>.stride),
+            .init(bufferIndex: colorBufferIndex, bufferStride: MemoryLayout<SIMD4<Float>>.stride),
         ]
 
-        let uvs = MuscleBodyMaterial.textureCoordinates(mesh: mesh)
         let lowLevel = try LowLevelMesh(descriptor: descriptor)
-        lowLevel.replaceUnsafeMutableBytes(bufferIndex: 0) { raw in
-            let vertices = raw.bindMemory(to: StaticVertex.self)
+        lowLevel.replaceUnsafeMutableBytes(bufferIndex: geometryBufferIndex) { raw in
+            let vertices = raw.bindMemory(to: GeometryVertex.self)
             for i in 0..<mesh.positions.count {
-                vertices[i] = StaticVertex(
-                    position: mesh.positions[i],
-                    normal: mesh.normals[i],
-                    uv: uvs[i]
-                )
+                vertices[i] = GeometryVertex(position: mesh.positions[i], normal: mesh.normals[i])
+            }
+        }
+        lowLevel.replaceUnsafeMutableBytes(bufferIndex: colorBufferIndex) { raw in
+            let buffer = raw.bindMemory(to: SIMD4<Float>.self)
+            let count = min(buffer.count, colors.count)
+            for i in 0..<count {
+                buffer[i] = colors[i]
             }
         }
         lowLevel.replaceUnsafeMutableIndices { raw in

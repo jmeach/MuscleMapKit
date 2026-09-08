@@ -10,6 +10,44 @@
 import Foundation
 import simd
 
+/// Axis-aligned bounds of the continuous body mesh, in model space.
+///
+/// The baked figure stands on `y = 0` (feet) with the head near `max.y`.
+/// The entity origin is therefore at the feet, not the visual center.
+struct MeshBounds: Equatable, Sendable {
+    var min: SIMD3<Float>
+    var max: SIMD3<Float>
+
+    static let zero = MeshBounds(min: .zero, max: .zero)
+
+    var center: SIMD3<Float> { (min + max) * 0.5 }
+    var extent: SIMD3<Float> { max - min }
+
+    /// Horizontal radius of the AABB when rotated about world Y through the origin.
+    var yawRadiusAboutOrigin: Float {
+        var radius: Float = 0
+        for x in [min.x, max.x] {
+            for z in [min.z, max.z] {
+                radius = Swift.max(radius, hypot(x, z))
+            }
+        }
+        return radius
+    }
+
+    var corners: [SIMD3<Float>] {
+        [
+            SIMD3(min.x, min.y, min.z),
+            SIMD3(min.x, min.y, max.z),
+            SIMD3(min.x, max.y, min.z),
+            SIMD3(min.x, max.y, max.z),
+            SIMD3(max.x, min.y, min.z),
+            SIMD3(max.x, min.y, max.z),
+            SIMD3(max.x, max.y, min.z),
+            SIMD3(max.x, max.y, max.z),
+        ]
+    }
+}
+
 struct BodyMesh: Sendable {
     var positions: [SIMD3<Float>] = []
     var normals: [SIMD3<Float>] = []
@@ -22,9 +60,9 @@ struct BodyMesh: Sendable {
     var vertexCount: Int { positions.count }
     var triangleCount: Int { indices.count / 3 }
 
-    var bounds: (min: SIMD3<Float>, max: SIMD3<Float>) {
+    var bounds: MeshBounds {
         guard let first = positions.first else {
-            return (.zero, .zero)
+            return .zero
         }
         var minP = first
         var maxP = first
@@ -32,7 +70,7 @@ struct BodyMesh: Sendable {
             minP = simd_min(minP, p)
             maxP = simd_max(maxP, p)
         }
-        return (minP, maxP)
+        return MeshBounds(min: minP, max: maxP)
     }
 
     /// Muscle group for a triangle, or nil for unassigned base body.

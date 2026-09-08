@@ -23,7 +23,8 @@ used by [coachlyAI](https://github.com/jmeach/coachlyAI). Rendering is
 .target(name: "YourApp", dependencies: ["MuscleMapKit"])
 ```
 
-Requires iOS 18+.
+Requires iOS 18+. Rendering uses RealityKit and a package-owned Metal
+surface shader loaded from `Bundle.module`.
 
 ## Use it
 
@@ -132,8 +133,16 @@ then every vertex is classified into one of the seventeen groups using
 limb-axis frames. That gets baked to a compact binary blob — position, normal,
 muscle id, and a blend weight per vertex — which ships in the package.
 
-At runtime RealityKit tints by muscle id. Recoloring replaces a tiny lookup
-texture and nothing else, so switching muscles costs no geometry work.
+At runtime RealityKit tints by muscle id. Recoloring rewrites only the
+per-vertex color buffer; positions, normals, indices, and collision stay
+put. A package-owned Metal surface shader (`muscleMapSurface`) lights the
+body with PBR and adds a restrained red-dominant emissive glow on
+activated muscle.
+
+The virtual camera does **not** orbit the body's foot-origin. Framing is
+computed from the baked mesh bounds: look at the visual center, fit the
+full height into a 36° vertical field of view, and keep every yaw of the
+bounding box on screen.
 
 Two consequences worth knowing:
 

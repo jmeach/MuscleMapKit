@@ -4,9 +4,11 @@ import SwiftUI
 /// Interactive RealityKit body that shades muscle regions from a `0...1` intensity map.
 ///
 /// The scene shell appears immediately; the baked mesh is attached once and then
-/// mutated in place. Drag horizontally to yaw. Vertical drags are ignored so a
-/// parent `ScrollView` can keep scrolling. Pass `interactive: false` only when
-/// the map must not handle gestures at all.
+/// mutated in place via the color vertex buffer. An explicit perspective camera
+/// frames the mesh bounds so the full figure stays visible. Drag horizontally
+/// to yaw. Vertical drags are ignored so a parent `ScrollView` can keep
+/// scrolling. Pass `interactive: false` only when the map must not handle
+/// gestures at all.
 public struct MuscleBody3DView: View {
     var intensities: [MuscleGroup: Double]
     var selected: Set<MuscleGroup> = []
@@ -59,7 +61,6 @@ public struct MuscleBody3DView: View {
             if content.entities.isEmpty {
                 content.add(session.model.root)
             }
-            content.cameraTarget = session.model.body
             await session.attachIfNeeded(
                 intensities: intensities,
                 selected: selected,
@@ -72,13 +73,12 @@ public struct MuscleBody3DView: View {
                 reduceMotion: reduceMotion,
                 after: 1.2
             )
-        } update: { content in
+        } update: { _ in
             session.model.apply(
                 intensities: intensities,
                 selected: selected,
                 style: resolvedStyle
             )
-            content.cameraTarget = session.model.body
         }
         .realityViewCameraControls(.none)
         .modifier(FlexibleRealityLayout())

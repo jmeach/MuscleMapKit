@@ -1,5 +1,5 @@
-import CoreGraphics
 import Foundation
+import Metal
 import RealityKit
 import simd
 import UIKit
@@ -67,9 +67,16 @@ public struct MuscleBodyStyle: Sendable, Equatable {
     }
 }
 
+enum MuscleBodyMaterialError: Error, Equatable {
+    case noMetalDevice
+    case missingMetalLibrary
+    case missingSurfaceShader(String)
+}
+
 enum MuscleBodyMaterial {
-    static let rampWidth = MuscleGroup.allCases.count + 1
-    static let rampHeight = 32
+    static let surfaceShaderName = "muscleMapSurface"
+    static let roughness: Float = 0.48
+    static let metallic: Float = 0.10
 
     static func groupColors(
         intensities: [MuscleGroup: Double],
@@ -81,101 +88,83 @@ enum MuscleBodyMaterial {
         }
     }
 
-    /// CPU reference for tests: per-vertex mix of base color and the group ramp.
+    /// Per-vertex mix of the graphite base and the group intensity color.
     static func vertexColors(
         mesh: BodyMesh,
         intensities: [MuscleGroup: Double],
         selected: Set<MuscleGroup>,
         style: MuscleBodyStyle
     ) -> [SIMD4<Float>] {
-        let groupColor = groupColors(intensities: intensities, selected: selected, style: style)
         var colors = [SIMD4<Float>](repeating: style.baseColor, count: mesh.positions.count)
-        for v in 0..<mesh.positions.count {
-            let id = mesh.muscleIds[v]
-            guard id >= 0, Int(id) < groupColor.count else { continue }
-            let blend = mesh.muscleBlend[v]
-            colors[v] = simd_mix(style.baseColor, groupColor[Int(id)], SIMD4(repeating: blend))
+        colors.withUnsafeMutableBufferPointer { buffer in
+            writeVertexColors(
+                to: buffer,
+                mesh: mesh,
+                intensities: intensities,
+                selected: selected,
+                style: style
+            )
         }
         return colors
     }
 
-    /// Immutable UVs: x selects base vs muscle column, y is the baked blend weight.
-    static func textureCoordinates(mesh: BodyMesh) -> [SIMD2<Float>] {
-        let width = Float(rampWidth)
-        return (0..<mesh.vertexCount).map { index in
-            let id = mesh.muscleIds[index]
-            if id < 0 {
-                return SIMD2(0.5 / width, 0)
-            }
-            return SIMD2((Float(id) + 1.5) / width, mesh.muscleBlend[index])
-        }
-    }
-
-    static func makeSurfaceMaterial(texture: TextureResource) -> PhysicallyBasedMaterial {
-        var material = PhysicallyBasedMaterial()
-        material.baseColor = .init(texture: .init(texture))
-        material.roughness = .init(floatLiteral: 0.48)
-        material.metallic = .init(floatLiteral: 0.10)
-        material.faceCulling = .none
-        return material
-    }
-
-    static func makeRampTexture(
+    static func writeVertexColors(
+        to buffer: UnsafeMutableBufferPointer<SIMD4<Float>>,
+        mesh: BodyMesh,
         intensities: [MuscleGroup: Double],
         selected: Set<MuscleGroup>,
         style: MuscleBodyStyle
-    ) throws -> TextureResource {
-        let groupColor = groupColors(intensities: intensities, selected: selected, style: style)
-        let width = rampWidth
-        let height = rampHeight
-        var pixels = [UInt8](repeating: 0, count: width * height * 4)
-        for y in 0..<height {
-            let blend = height == 1 ? 1 : Float(y) / Float(height - 1)
-            write(style.baseColor, x: 0, y: y, width: width, pixels: &pixels)
-            for group in 0..<groupColor.count {
-                let mixed = simd_mix(style.baseColor, groupColor[group], SIMD4(repeating: blend))
-                write(mixed, x: group + 1, y: y, width: width, pixels: &pixels)
-            }
-        }
-        let data = Data(pixels)
-        guard let provider = CGDataProvider(data: data as CFData),
-              let image = CGImage(
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bitsPerPixel: 32,
-                bytesPerRow: width * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                provider: provider,
-                decode: nil,
-                shouldInterpolate: true,
-                intent: .defaultIntent
-              ) else {
-            throw MuscleBodyMeshError.truncated
-        }
-        return try TextureResource.generate(
-            from: image,
-            withName: "muscleMapRamp",
-            options: TextureResource.CreateOptions(semantic: .color)
-        )
-    }
-
-    private static func write(
-        _ color: SIMD4<Float>,
-        x: Int,
-        y: Int,
-        width: Int,
-        pixels: inout [UInt8]
     ) {
-        let i = (y * width + x) * 4
-        pixels[i] = channel(color.x)
-        pixels[i + 1] = channel(color.y)
-        pixels[i + 2] = channel(color.z)
-        pixels[i + 3] = channel(color.w)
+        let groupColor = groupColors(intensities: intensities, selected: selected, style: style)
+        let count = min(buffer.count, mesh.positions.count)
+        for v in 0..<count {
+            let id = mesh.muscleIds[v]
+            guard id >= 0, Int(id) < groupColor.count else {
+                buffer[v] = style.baseColor
+                continue
+            }
+            let blend = mesh.muscleBlend[v]
+            buffer[v] = simd_mix(style.baseColor, groupColor[Int(id)], SIMD4(repeating: blend))
+        }
     }
 
-    private static func channel(_ value: Float) -> UInt8 {
-        UInt8(max(0, min(1, value)) * 255)
+    static func loadMetalLibrary(device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws -> MTLLibrary {
+        guard let device else {
+            throw MuscleBodyMaterialError.noMetalDevice
+        }
+        do {
+            return try device.makeDefaultLibrary(bundle: .module)
+        } catch {
+            throw MuscleBodyMaterialError.missingMetalLibrary
+        }
     }
+
+    @MainActor
+    static func makeSurfaceMaterial() throws -> CustomMaterial {
+        if let cached = cachedMaterial {
+            return cached
+        }
+        let library = try loadMetalLibrary()
+        let shader = CustomMaterial.SurfaceShader(named: surfaceShaderName, in: library)
+        let material: CustomMaterial
+        do {
+            var pbr = PhysicallyBasedMaterial()
+            pbr.baseColor = .init(tint: .white)
+            pbr.roughness = .init(floatLiteral: roughness)
+            pbr.metallic = .init(floatLiteral: metallic)
+            pbr.faceCulling = .none
+            var created = try CustomMaterial(from: pbr, surfaceShader: shader)
+            created.roughness = .init(floatLiteral: roughness)
+            created.metallic = .init(floatLiteral: metallic)
+            created.faceCulling = .none
+            material = created
+        } catch {
+            throw MuscleBodyMaterialError.missingSurfaceShader(surfaceShaderName)
+        }
+        cachedMaterial = material
+        return material
+    }
+
+    @MainActor
+    private static var cachedMaterial: CustomMaterial?
 }
